@@ -1,0 +1,242 @@
+---
+
+- hosts: localhost
+  connection: local
+  gather_facts: no
+
+  vars:
+      AWXScheduled: "yes"
+
+
+  tasks:
+
+    - name: Reset ASGs if present
+      command: >
+        aws autoscaling update-auto-scaling-group --region "{{ region }}" \
+                                                  --auto-scaling-group-name "{{ item.name }}" \
+                                                  --desired-capacity "0" \
+                                                  --min-size "0"
+      loop: "{{ asg }}"
+      when: state == 'stopped' and asg is defined and not instance_name_filter|length
+
+
+    - name: Valuating if discovery must be run against only AWXScheduled == yes instances ot not
+      ansible.builtin.set_fact:
+           AWXScheduled_tmp: ""
+      when:  JobOnlyforAWXScheduled == "no"
+
+    - name: Setting other facts
+      ansible.builtin.set_fact:
+         hosts_arg_for_startstop_apps: "{{ instance_name_filter|replace(',' , '|')|map('trim')|list|join('') }}"
+         instances: "{% if instance_name_filter == '' %}{% else %}{{ instance_name_filter.split(',') |map('trim')|list }}{% endif %}"
+         controller: "{{ hostvars[groups['controller'][0]]['inventory_hostname'] }}"
+
+    #- debug:
+    #    var: AWXScheduled_tmp
+
+    - name: Get tagged instances on the AWS account
+      ec2_instance_info:
+        region: '{{ region }}'
+        filters:
+          "instance-state-name": [ "started", "running", "stopped" ]
+          "tag:Title": "{{ title | upper | default(omit, True) }}"
+          "tag:Environment": "{{ env | upper }}"
+          "tag:VPC": "{{ vpc_name }}"
+          "tag:Role": '{{ role | default(omit, True) }}'
+          "tag:Name": "{{ instances | default(omit, True)}}"
+          "tag:AWXScheduled": "{{ AWXScheduled_tmp | default(AWXScheduled) | default(omit, True)}}"
+          "tag:methodeDBtype": "{{ methodeDBtype }}"
+      register: ec2
+
+    - debug:
+        var: ec2.instances
+        verbosity: 1
+
+    - name: Stop applications
+      # Please note log redirect not in append , to avoid incresing too much
+      shell: 'su - appmanager -c ". ~/.bash_profile; run.bash --stop -e {{ methodeDBtype }}-{{ methenv }}-1 --hosts \"{{ hosts_arg_for_startstop_apps }}\" >> \$HOME/logfiles/run.bash_stop_{{ methodeDBtype }}.log 2>&1"'
+      async: 3600
+      remote_user: "{{ superadmin }}"
+      become: yes
+      become_user: root
+      delegate_to:  "{{ controller }}"
+      ignore_errors: true
+      when: state == 'stopped' and start_methode_services == 'yes'
+
+    - name: Stop jenkins
+      shell: 'su - appmanager -c ". ~/.bash_profile; stop_processes.bash $(hostname -f) \$GROUP_JENKINS >> ./logfiles/start_stop_jenkins.log 2>&1"'
+      async: 3600
+      remote_user: "{{ superadmin }}"
+      become: yes
+      become_user: root
+      delegate_to:  "{{ controller }}"
+      ignore_errors: true
+      when: state == 'stopped' and ( not instances|length or hostvars[groups['controller'][0]]['inventory_hostname'].split('.')[0] in instances ) and methodeDBtype == 'editorial' and start_methode_services == 'yes'
+
+
+    - name: Change EC2 instances status by tags
+      ec2_instance:
+        instance_ids: "{{ ec2.instances | map(attribute='instance_id') | list }}"
+        region: '{{ region }}'
+        state: '{{ state }}'
+        wait: "{% if state == 'running' %}yes{% else %}no{% endif %}"
+        wait_timeout: 30
+    - name: Wait for ssh/rdp to become available
+      wait_for:
+        host: '{{ item.private_ip_address }}'
+        port: "{% if 'windows' in item.tags.OS|lower %}3389{% else %}22{% endif %}"
+        delay: 2
+      loop: "{{ ec2.instances }}"
+      when: state == 'running' 
+
+    - name: Get maintenance hosts and domain user order from controller
+      block:
+
+          - name: Getting from controller file /methode/appmanager/cfg/servers-{{ methodeDBtype }}-$METHENV-1.cfg
+            delegate_to:  "{{ controller }}"
+            async: 30
+            poll: 3
+            remote_user: "{{ superadmin }}"
+            become: yes
+            become_user: root
+            shell: 'su - {{ controller_domain_user }} -c ". ~/.bash_profile; cat cfg/servers-{{ methodeDBtype }}-\${METHENV}-1.cfg |egrep -v "^#"|cut -f 1,2,3,4 -d \" \"|perl -pi -e "s%\\\\$%%g" |egrep -v ^#"'
+            register: cfgservers
+
+          - name: Importing servers-{{ methodeDBtype }}-$METHENV-1.cfg in a list of dictionaries
+            set_fact:
+                list_of_dicts_from_cfgservers: "{{ list_of_dicts_from_cfgservers | default([]) +[ { 'host': item.split()[1], 'user': item.split()[0], 'group': item.split()[3], 'desc':item.split()[2] } ]  }}"
+            with_items: 
+                - "{{ cfgservers.stdout_lines }}"
+          - set_fact:
+                core_server: "{{ list_of_dicts_from_cfgservers| json_query(query_core) }}"
+                worker_server: "{{ list_of_dicts_from_cfgservers| json_query(query_worker) }}"
+            vars:
+                query_core: '[?desc==`Methode-{{ methodeDBtype[0]|upper }}{{ methodeDBtype[1:] }}-Core`]'
+                query_worker: '[?desc==`Methode-{{ methodeDBtype[0]|upper }}{{ methodeDBtype[1:] }}-Worker`]'
+
+          - name: Fail in case no GROUP_CORE can be detected in controller file /methode/appmanager/cfg/servers-{{ methodeDBtype }}-$METHENV-1.cfg
+            fail:
+               msg: "Failed cause not able to find GROUP_CORE host in controller's /methode/appmanager/cfg/servers-{{ methodeDBtype }}-$METHENV-1.cfg"
+            when: core_server[0] is not defined
+
+            
+           # removing GROUP_WORKER from list_of_dicts_from_cfgservers in case of a monolithic installation with worker and core group on the same server. To avoid  maitenances being called on the same node both for worker an core
+          - set_fact:
+                list_of_dicts_from_cfgservers: "{{ list_of_dicts_from_cfgservers| reject('search', worker_server[0]|string)|list }}"
+            when: worker_server[0] is defined and core_server[0].host == worker_server[0].host
+
+
+          - set_fact:
+               linux_servers: "{{  linux_servers|default([]) + [ item.host ]  }}"
+            with_items:
+                 - "{{ list_of_dicts_from_cfgservers }}"
+            when: item.group != 'PRIMESERVICE'    
+
+          - set_fact:
+               check_db_str: "DATABASE_INCONSISTENT"
+
+
+          - name: Clean .ansible_async folders
+          # IMPORTANT FOR FUTURES extension/revisions, change .ansible_async path accordingly in case using a become_user different from 'root'
+            shell: '[ -d /root/.ansible_async ] && find /root/.ansible_async/* -mtime +4 -exec rm -fr {} \; 2>/dev/null; echo'
+            delegate_to: "{{ item }}"
+            remote_user: "{{ superadmin }}"
+            become: yes
+            become_user: root
+            with_items: 
+            # "{{ linux_servers + [ controller ] }}" --> in case controller is not present in cfg/servers-${METHENV}-1.cfg , as usual -- otherwise, adding will not change in any case playboook logics.IN future after awx upgrade , this can be fixed with unique jinja filter.Please not linux_servers must not be modified to contain controller if not present in cfg/servers-${METHENV}-1.cfg.
+                 - "{{ linux_servers + [ controller ] }}"
+
+      when: state == 'running' and ExecuteMaintenance == "yes" and start_methode_services == 'yes'
+
+                
+    - name: Executing maintenance in asynchronous jobs
+      block:
+          - name: Execute admin/maint.sh weekly -- for each hosts and domain users -- and also DB syscheck in case GOLDOCPY=0 on methuser env
+            delegate_to:  "{{ item.host }}"
+            async: 3600
+            poll: 0
+            register: async_maintenances
+            remote_user: "{{ superadmin }}"
+            become: yes
+            become_user: root
+            shell: 'su - {{ item.user }} -c ". ~/.bash_profile; [[ -e admin/maint.bash ]] && NOACTIVE_BASH=true admin/maint.bash W; retcode=$?; if [[ "{{ item.group }}" == "GROUP_CORE" ]] && [[ "${GOLDCOPY:=1}" == 0 ]]; then cat logfiles/maint.log|grep ^Database|grep consistent.  || (echo DATABASE_INCONSISTENT && /bin/false ) ; else echo $retcode; fi"'
+            with_items:  "{{ list_of_dicts_from_cfgservers }}"
+            when: item.group != 'PRIMESERVICE'
+                 
+                  
+          # remove the skipped from results
+          - set_fact:
+              maint_results : "{{ maint_results |default([]) + [ item ] }}"
+            with_items: "{{ async_maintenances.results }}"
+            when: item.skipped is not defined
+          
+
+          - name: Check if maintenances have been completed
+            async_status:
+              jid: "{{ jobs_and_hosts[0].ansible_job_id }}"
+            register: job_result
+            until: job_result.finished
+            remote_user: "{{ superadmin }}"
+            become: yes
+            become_user: root
+            delegate_to:  "{{ jobs_and_hosts[1]   }}"
+            #delay: 10
+            #retries: 360
+            delay: 40
+            retries: 90
+            loop: "{{ maint_results |zip(linux_servers) |list  }}"
+            loop_control:
+              loop_var: jobs_and_hosts
+
+      when: state == 'running' and ExecuteMaintenance == "yes" and start_methode_services == 'yes'
+      rescue:
+          - name: Force exit in case of dbsyscheck failure
+            shell: '/bin/false'
+            when:  check_db_str  in item.stdout
+            with_items: "{{ job_result.results }}"
+          - name: Force keep on execution in case of other maintenances exceptions
+            shell: '/bin/true'
+
+    - name: Stop again all applications just started after the maintenances 
+      # Stopping all appliacation to restart later in ordered way
+      shell: 'su - appmanager -c ". ~/.bash_profile; run.bash --stop -e {{ methodeDBtype }}-{{ methenv }}-1 --hosts \"{{ hosts_arg_for_startstop_apps }}\" "'
+      async: 3600
+      remote_user: "{{ superadmin }}"
+      become: yes
+      become_user: root
+      delegate_to:  "{{ controller }}"
+      ignore_errors: true
+      when: state == 'running' and ExecuteMaintenance == "yes" and start_methode_services == 'yes'
+
+    - name: Start applications
+      # Please note log redirect not in append , to avoid incresing too much
+      shell: 'su - appmanager -c ". ~/.bash_profile; run.bash --start -e {{ methodeDBtype }}-{{ methenv }}-1 --hosts \"{{ hosts_arg_for_startstop_apps }}\" >> \$HOME/logfiles/run.bash_start_{{ methodeDBtype }}.log 2>&1"'
+      async: 3600
+      remote_user: "{{ superadmin }}"
+      become: yes
+      become_user: root
+      delegate_to:  "{{ controller }}"
+      ignore_errors: true
+      when: state == 'running' and start_methode_services == 'yes'
+
+    - name: Start jenkins
+      shell: 'su - appmanager -c ". ~/.bash_profile; start_processes.bash $(hostname -f) \$GROUP_JENKINS >> ./logfiles/start_stop_jenkins.log 2>&1"'
+      async: 3600
+      remote_user: "{{ superadmin }}"
+      become: yes
+      become_user: root
+      delegate_to:  "{{ controller }}"
+      ignore_errors: true
+      when: state == 'running' and ( not instances|length or hostvars[groups['controller'][0]]['inventory_hostname'].split('.')[0] in instances ) and  methodeDBtype == 'editorial' and start_methode_services == 'yes'
+
+    - name: Start ASGs if present
+      command: >
+        aws autoscaling update-auto-scaling-group --region "{{ region }}" \
+                                                  --auto-scaling-group-name "{{ item.name }}" \
+                                                  --desired-capacity "{{ item.desired_capacity }}" \
+                                                  --min-size "{{ item.min_size }}"
+      loop: "{{ asg }}"
+      when: state == 'running' and asg is defined and not instance_name_filter|length
+
+
